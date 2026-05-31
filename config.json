@@ -3,5 +3,6 @@
     "output_dir": ".",
     "storage_state": "deepseek_storage_state.json",
     "element_timeout": 20000,
-    "download_timeout": 60000
+    "download_timeout": 60000,
+    "api_key": "sk-your-deepseek-api-key"
 }

@@ -6,6 +6,7 @@ DeepSeek API 使用数据 — 桌面磁贴看板
 """
 
 # ── 标准库 ──────────────────────────────────────────────
+import json        # 读取 config.json 中的 API Key
 import re          # 正则表达式，用于解析窗口 geometry 字符串
 import threading   # 后台线程执行网络下载，不阻塞 UI
 from datetime import datetime  # 状态栏显示当前刷新时间
@@ -18,6 +19,7 @@ matplotlib.use('TkAgg')  # 指定 matplotlib 后端为 tkinter
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import requests  # 调用 DeepSeek Balance API
 
 # ── 本地模块 ────────────────────────────────────────────
 # dataDownload 需要 playwright，未安装时跳过下载功能，不影响本地数据展示
@@ -101,9 +103,11 @@ class UsageWidget:
         # ── 数据缓存 ──
         self.cost_df = None    # 费用 DataFrame
         self.amount_df = None  # Token 用量 DataFrame
+        self._balance_cache = None  # 余额缓存
 
         # ── 构建界面组件 ──
         self._build_titlebar()
+        self._build_balance_bar()   # 顶部余额/消费展示栏
         self._build_chart_grid()
         self._build_statusbar()
         self._bind_events()
@@ -111,6 +115,7 @@ class UsageWidget:
 
         # ── 首次加载数据（不触发网络下载，由 main.py 在启动前已下载好） ──
         self._load_local()
+        self._start_balance_fetch()  # 后台获取余额
         self.root.after(REFRESH_MS, self._auto_refresh)
 
     # ══════════════════════════════════════════════════════
@@ -163,6 +168,26 @@ class UsageWidget:
                                bg=self._C['panel'], fg=self._C['status_fg'],
                                font=('Microsoft YaHei', 8), anchor=tk.W)
         self.status.pack(fill=tk.X, side=tk.BOTTOM, padx=8, pady=(0, 4))
+
+    # ── 顶部余额/消费展示栏 ──
+    def _build_balance_bar(self):
+        """创建顶部余额/消费信息栏，左右分别显示余额和本月消费"""
+        C = self._C
+        bar = tk.Frame(self.root, bg=C['panel'], height=48)
+        bar.pack(fill=tk.X, side=tk.TOP)
+        bar.pack_propagate(False)
+
+        self._balance_label = tk.Label(bar, text='💰 余额    --',
+                                       bg=C['panel'], fg='#4ECDC4',
+                                       font=('Microsoft YaHei', 14, 'bold'))
+        self._balance_label.pack(side=tk.LEFT, padx=20, pady=8)
+
+        self._cost_label = tk.Label(bar, text='📊 本月消费    --',
+                                    bg=C['panel'], fg='#FF6B6B',
+                                    font=('Microsoft YaHei', 14, 'bold'))
+        self._cost_label.pack(side=tk.RIGHT, padx=20, pady=8)
+
+        self._balance_bar = bar
 
     # ══════════════════════════════════════════════════════
     #  鼠标事件：拖动 + 边缘缩放 + 双击全屏
@@ -331,6 +356,9 @@ class UsageWidget:
         lbl.configure(bg=C['panel'], fg=C['fg'])
         btn.configure(bg=C['panel'])
         self.main.configure(bg=C['bg'])                     # 图表容器
+        self._balance_bar.configure(bg=C['panel'])           # 余额栏
+        self._balance_label.configure(bg=C['panel'])
+        self._cost_label.configure(bg=C['panel'])
         for f in self.frames.values():
             f.configure(bg=C['bg'], highlightbackground=C['border'])
         self.status.configure(bg=C['panel'], fg=C['status_fg'])  # 状态栏
@@ -340,6 +368,67 @@ class UsageWidget:
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei'] \
                                            + plt.rcParams.get('font.sans-serif', [])
         plt.rcParams['axes.unicode_minus'] = False
+
+    # ══════════════════════════════════════════════════════
+    #  余额/消费 API
+    # ══════════════════════════════════════════════════════
+
+    def _start_balance_fetch(self):
+        """后台线程获取账户余额"""
+        threading.Thread(target=self._balance_worker, daemon=True).start()
+
+    def _balance_worker(self):
+        """后台线程：调用 DeepSeek API 获取充值余额"""
+        try:
+            with open('config.json', 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            api_key = cfg.get('api_key', '')
+            if not api_key or api_key.startswith('sk-your'):
+                self.root.after(0, self._on_balance_fetched, None)
+                return
+            resp = requests.get(
+                'https://api.deepseek.com/user/balance',
+                headers={'Authorization': f'Bearer {api_key}'},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            infos = data.get('balance_infos', [])
+            balance = float(infos[0]['topped_up_balance']) if infos else None
+            self.root.after(0, self._on_balance_fetched, balance)
+        except Exception:
+            self.root.after(0, self._on_balance_fetched, None)
+
+    def _on_balance_fetched(self, balance):
+        """余额获取完成回调（主线程）"""
+        self._balance_cache = balance
+        self._refresh_balance_display()
+
+    def _compute_monthly_cost(self):
+        """从 cost_df 中计算本月（当前自然月）消费总额"""
+        if self.cost_df is None or self.cost_df.empty:
+            return None
+        now = datetime.now()
+        prefix = f'{now.year}-{now.month:02d}'
+        mask = self.cost_df['utc_date'].astype(str).str.startswith(prefix)
+        return self.cost_df.loc[mask, 'cost'].sum()
+
+    def _refresh_balance_display(self):
+        """更新余额和消费显示（主线程调用）"""
+        C = self._C
+        bal = self._balance_cache
+        cost = self._compute_monthly_cost()
+        grey = C.get('status_fg', '#888')
+
+        if bal is not None:
+            self._balance_label.config(text=f'💰 余额    ¥{bal:.2f}', fg='#4ECDC4')
+        else:
+            self._balance_label.config(text='💰 余额    --', fg=grey)
+
+        if cost is not None:
+            self._cost_label.config(text=f'📊 本月消费    ¥{cost:.2f}', fg='#FF6B6B')
+        else:
+            self._cost_label.config(text='📊 本月消费    --', fg=grey)
 
     # ══════════════════════════════════════════════════════
     #  数据加载与刷新
@@ -354,6 +443,7 @@ class UsageWidget:
             date_min = self.cost_df['utc_date'].min()
             date_max = self.cost_df['utc_date'].max()
             self.status.config(text=f'本地数据  |  {date_min} ~ {date_max}  |  {datetime.now():%H:%M}')
+            self._refresh_balance_display()
         except Exception as exc:
             self.status.config(text=f'✗ 无本地数据: {exc}')
 
@@ -392,6 +482,7 @@ class UsageWidget:
         date_min = self.cost_df['utc_date'].min()
         date_max = self.cost_df['utc_date'].max()
         self.status.config(text=f'✓ 已更新  |  {date_min} ~ {date_max}  |  {datetime.now():%H:%M}')
+        self._refresh_balance_display()
         self._refreshing = False
 
     def _fallback_local(self, _):
@@ -401,6 +492,7 @@ class UsageWidget:
             zp = read_zip_name()
             self.cost_df, self.amount_df = read_csv_from_zip(zp)
             self._render()
+            self._refresh_balance_display()
         except Exception:
             pass
         self._refreshing = False
