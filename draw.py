@@ -33,7 +33,8 @@ except ImportError:
 from data_Process import (
     read_csv_from_zip, read_zip_name,
     data_samedate_cost, data_samemodel_cost,
-    data_samedatemodel_tokeninfo, date_samemodelname_tokeninfo,
+    data_samedatemodel_tokeninfo, data_samedatemodel_requestinfo, 
+    date_samemodelname_tokeninfo,
 )
 
 # ── 全局配置 ────────────────────────────────────────────
@@ -575,7 +576,7 @@ class UsageWidget:
         cost, amount = self.cost_df, self.amount_df
 
         # 1 折线图 —— 每日费用趋势
-        df_line = data_samedate_cost(cost)
+        df_line = data_samedatemodel_requestinfo(amount)
         self._clear_frame(self.frames['line'])
         self._embed_line(self.frames['line'], df_line)
 
@@ -599,15 +600,21 @@ class UsageWidget:
     # 每个方法创建一个 matplotlib Figure，用 FigureCanvasTkAgg 嵌入 tkinter 帧
 
     def _embed_line(self, parent, df):
-        """折线图：X 轴为日期，Y 轴为总费用"""
+        """折线图：X 轴为日期，Y 轴为请求数，按 model 绘制多条折线"""
         C = self._C
         fig = Figure(figsize=(3.6, 2.4), dpi=100, facecolor=C['fig_face'])
         ax = fig.add_subplot(111, facecolor=C['ax_face'])
-        ax.plot(df['utc_date'].astype(str), df['cost'], color='#4ECDC4',
-                marker='o', linewidth=1.5, markersize=3)
-        ax.set_title('每日消耗趋势', color=C['title_fg'], fontsize=9, pad=6)
+        models = sorted(df['model'].unique())
+        for i, model in enumerate(models):
+            sub = df[df['model'] == model]
+            short_name = model.replace('deepseek-v4-', '')
+            ax.plot(sub['utc_date'].astype(str), sub['amount'],
+                    color=COLORS[i % len(COLORS)],
+                    marker='o', linewidth=1.5, markersize=3, label=short_name)
+        ax.set_title('每日请求量趋势', color=C['title_fg'], fontsize=9, pad=6)
         ax.tick_params(colors=C['tick_color'], labelsize=6)
-        ax.set_ylabel('CNY', color=C['label_color'], fontsize=7)
+        ax.set_ylabel('Requests', color=C['label_color'], fontsize=7)
+        ax.legend(fontsize=5, labelcolor=C['legend_color'])
         fig.autofmt_xdate(rotation=40)
         fig.tight_layout(pad=1.5)
         canvas = FigureCanvasTkAgg(fig, parent)

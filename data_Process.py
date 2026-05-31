@@ -1,5 +1,7 @@
 "解压压缩包，读取数据，处理数据，保存数据到数据库中。"
 import os
+import re
+from unittest import result
 import zipfile
 import pandas as pd
 import glob
@@ -62,6 +64,10 @@ def data_samedatemodel_tokeninfo(amount):
     result = amount.groupby(["utc_date","model", "type"])["amount"].sum().reset_index()
     # print_centered(result)
     return result
+def data_samedatemodel_requestinfo(amount):
+    result = amount[amount["type"] == "request_count"].groupby(["utc_date","model","type"])["amount"].sum().reset_index()
+    # print_centered(result)
+    return result
 
 def date_samemodelname_tokeninfo(amount):
     # 过滤掉 request_count，按 api_key_name 和 type 分组求和
@@ -99,6 +105,7 @@ def main():
     data_samemodel_cost(cost)
     data_samedatemodel_cost(cost)
     data_samedatemodel_tokeninfo(amount)
+    data_samedatemodel_requestinfo(amount)
     date_samemodelname_tokeninfo(amount)
 
 if __name__ == "__main__":
