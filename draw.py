@@ -89,6 +89,8 @@ class UsageWidget:
         self._x, self._y = 0, 0
         self._fullscreen = False
         self._refreshing = False     # 防止重复刷新
+        self._refresh_timer_id = None  # 保存计时器ID，用于取消和重置
+        self._refresh_interval = 60_000  # 可配置的刷新间隔（毫秒），默认60秒
 
         # ── 主题配色 ──
         self._theme = 'dark'         # 当前主题名：'dark' | 'light'
@@ -116,7 +118,20 @@ class UsageWidget:
         # ── 首次加载数据（不触发网络下载，由 main.py 在启动前已下载好） ──
         self._load_local()
         self._start_balance_fetch()  # 后台获取余额
-        self.root.after(REFRESH_MS, self._auto_refresh)
+        self._schedule_refresh()  # 使用统一的调度方法
+
+    # ══════════════════════════════════════════════════════
+    #  计时器管理
+    # ══════════════════════════════════════════════════════
+
+    def _schedule_refresh(self):
+        """安排下一次自动刷新，倒计时REFRESH_MS后执行"""
+        # 取消旧的计时器（如果存在）
+        if self._refresh_timer_id:
+            self.root.after_cancel(self._refresh_timer_id)
+
+        # 创建新的计时器
+        self._refresh_timer_id = self.root.after(self._refresh_interval, self._auto_refresh)
 
     # ══════════════════════════════════════════════════════
     #  界面构建
@@ -323,6 +338,32 @@ class UsageWidget:
         self.menu.add_separator()
         self.menu.add_command(label='🔘 切换透明度', command=self._toggle_alpha)
         self.menu.add_separator()
+
+        # 刷新间隔子菜单
+        refresh_menu = Menu(self.menu, tearoff=0,
+                           bg=self._C['menu_bg'], fg=self._C['menu_fg'],
+                           activebackground=self._C['menu_active_bg'],
+                           activeforeground=self._C['menu_active_fg'])
+
+        # 定义预设选项
+        interval_options = [
+            ('30秒', 30),
+            ('1分钟', 60),
+            ('2分钟', 120),
+            ('5分钟', 300),
+            ('10分钟', 600),
+            ('关闭自动刷新', 0),
+        ]
+
+        for label, seconds in interval_options:
+            refresh_menu.add_command(
+                label=label,
+                command=lambda s=seconds: self._set_refresh_interval(s)
+            )
+
+        self.menu.add_cascade(label='⏱ 刷新间隔', menu=refresh_menu)
+        self.menu.add_separator()
+
         # 菜单文字随当前主题动态变化
         theme_label = '🎨 切换白色背景' if self._theme == 'dark' else '🎨 切换暗色背景'
         self.menu.add_command(label=theme_label, command=self._toggle_theme)
@@ -334,6 +375,20 @@ class UsageWidget:
     def _toggle_alpha(self):
         a = self.root.attributes('-alpha')
         self.root.attributes('-alpha', 0.35 if a > 0.5 else 1.0)
+
+    def _set_refresh_interval(self, seconds):
+        """设置刷新间隔并立即生效"""
+        self._refresh_interval = seconds * 1000  # 转换为毫秒
+        self._schedule_refresh()  # 立即应用新间隔
+
+        # 在状态栏显示设置结果
+        if seconds >= 60:
+            self.status.config(text=f'刷新间隔已设置为 {seconds//60} 分钟')
+        else:
+            self.status.config(text=f'刷新间隔已设置为 {seconds} 秒')
+
+        # 3秒后恢复状态栏显示
+        self.root.after(3000, lambda: self._refresh_balance_display())
 
     # ══════════════════════════════════════════════════════
     #  主题切换
@@ -457,6 +512,7 @@ class UsageWidget:
         if not _HAS_DOWNLOAD:
             self._load_local()
             self._refreshing = False
+            self._schedule_refresh()  # 重置计时器
             return
 
         self.status.config(text='⏳ 正在下载最新数据…')
@@ -484,6 +540,7 @@ class UsageWidget:
         self.status.config(text=f'✓ 已更新  |  {date_min} ~ {date_max}  |  {datetime.now():%H:%M}')
         self._refresh_balance_display()
         self._refreshing = False
+        self._schedule_refresh()  # 重置计时器
 
     def _fallback_local(self, _):
         """下载失败时回退到本地已有数据"""
@@ -496,11 +553,12 @@ class UsageWidget:
         except Exception:
             pass
         self._refreshing = False
+        self._schedule_refresh()  # 重置计时器
 
     def _auto_refresh(self):
-        """定时器：每隔 REFRESH_MS 自动刷新一次"""
+        """定时器回调：执行刷新并重新安排下一次"""
         self.refresh()
-        self.root.after(REFRESH_MS, self._auto_refresh)
+        self._schedule_refresh()  # 使用统一的调度方法
 
     # ── 清空子帧中的旧图表 ──
     @staticmethod
