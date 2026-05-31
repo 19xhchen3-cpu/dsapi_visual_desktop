@@ -6,12 +6,39 @@ dsapi_visual
 
 自动从 DeepSeek 用量页面（`https://platform.deepseek.com/usage`）导出用量数据并保存到本地。
 
+## 环境要求与安装
+
+### 必需的 Python 包
+
+在运行项目前，请确保安装以下依赖包：
+
+```bash
+# 安装必需的包
+pip install pandas matplotlib playwright
+
+# 下载 Playwright 浏览器驱动
+playwright install msedge
+```
+
+### 创建虚拟环境（推荐）
+
+```bash
+# 创建 conda 虚拟环境
+conda create -n dsapi python=3.12
+conda activate dsapi
+
+# 安装依赖
+pip install pandas matplotlib playwright
+playwright install msedge
+```
+
 ## 功能
 
 - 一键导出 DeepSeek API 的用量数据（调用次数、Token 消耗等）
 - 支持自定义输出目录
 - 仅需一次登录，后续导出无需重复登录
 - 导出过程无浏览器窗口弹出
+- 桌面磁贴看板实时显示 API 使用情况
 
 ## 工作原理
 

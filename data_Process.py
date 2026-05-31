@@ -45,22 +45,22 @@ def read_zip_name():
 #读取对应的文件，将里面的内容进行处理
 def data_samedate_cost(cost):
     result = cost.groupby("utc_date")["cost"].sum().reset_index()
-    print_centered(result)
+    # print_centered(result)
     return result
 
 def data_samemodel_cost(cost):
     result = cost.groupby("model")["cost"].sum().reset_index()
-    print_centered(result)
+    # print_centered(result)
     return result
 
 def data_samedatemodel_cost(cost):
     result = cost.groupby(["utc_date","model"])["cost"].sum().reset_index()
-    print_centered(result)
+    # print_centered(result)
     return result
 
 def data_samedatemodel_tokeninfo(amount):
     result = amount.groupby(["utc_date","model", "type"])["amount"].sum().reset_index()
-    print_centered(result)
+    # print_centered(result)
     return result
 
 def date_samemodelname_tokeninfo(amount):
@@ -79,7 +79,7 @@ def date_samemodelname_tokeninfo(amount):
     result["_sort"] = result["type"].map(type_order)
     result = result.sort_values(["model", "api_key_name", "_sort"]).drop(columns=["_sort"]).reset_index(drop=True)
 
-    print_centered(result)
+    # print_centered(result)
     return result
 
 def  draw_datemodelcost():
