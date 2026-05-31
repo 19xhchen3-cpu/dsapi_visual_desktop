@@ -8,6 +8,7 @@ DeepSeek API 使用数据 — 桌面磁贴看板
 # ── 标准库 ──────────────────────────────────────────────
 import re          # 正则表达式，用于解析窗口 geometry 字符串
 import threading   # 后台线程执行网络下载，不阻塞 UI
+from datetime import datetime  # 状态栏显示当前刷新时间
 import tkinter as tk
 from tkinter import Menu
 
@@ -77,7 +78,7 @@ class UsageWidget:
     def __init__(self):
         # ── 创建根窗口 ──
         self.root = tk.Tk()
-        self.root.title("DeepSeek Usage")
+        self.root.title("DeepSeek API 使用情况看板")
 
         # ── 窗口样式：无边框 + 置顶 ──
         self.root.overrideredirect(True)
@@ -122,7 +123,7 @@ class UsageWidget:
         bar.pack(fill=tk.X, side=tk.TOP)
         bar.pack_propagate(False)
 
-        lbl = tk.Label(bar, text="⬡ DeepSeek Usage",
+        lbl = tk.Label(bar, text="DeepSeek API 使用情况看板",
                        bg=self._C['panel'], fg=self._C['fg'],
                        font=('Microsoft YaHei', 10))
         lbl.pack(side=tk.LEFT, padx=12)
@@ -352,7 +353,7 @@ class UsageWidget:
             self._render()
             date_min = self.cost_df['utc_date'].min()
             date_max = self.cost_df['utc_date'].max()
-            self.status.config(text=f'本地数据  |  {date_min} ~ {date_max}')
+            self.status.config(text=f'本地数据  |  {date_min} ~ {date_max}  |  {datetime.now():%H:%M}')
         except Exception as exc:
             self.status.config(text=f'✗ 无本地数据: {exc}')
 
@@ -390,7 +391,7 @@ class UsageWidget:
         self._render()
         date_min = self.cost_df['utc_date'].min()
         date_max = self.cost_df['utc_date'].max()
-        self.status.config(text=f'✓ 已更新  |  {date_min} ~ {date_max}')
+        self.status.config(text=f'✓ 已更新  |  {date_min} ~ {date_max}  |  {datetime.now():%H:%M}')
         self._refreshing = False
 
     def _fallback_local(self, _):
@@ -506,6 +507,14 @@ class UsageWidget:
                     ax.bar(pos, vals, bar_width, label=lbl if i == 0 else '',
                            color=clr, bottom=bottoms, edgecolor='none')
                     bottoms = [b + v for b, v in zip(bottoms, vals)]
+
+            # 在柱顶标注模型名称（flash / pro），方便区分两个模型
+            short_name = model.replace('deepseek-v4-', '')
+            offset = max(bottoms) * 0.02 if max(bottoms) > 0 else 0
+            for xi, tot in enumerate(bottoms):
+                ax.text(pos[xi], tot + offset, short_name,
+                        ha='center', va='bottom', fontsize=5,
+                        color=C['legend_color'])
 
         ax.set_xticks(x_pos)
         ax.set_xticklabels([str(d) for d in dates], rotation=40,
