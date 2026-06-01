@@ -5,9 +5,8 @@ __pycache__/
 
 # 浏览器登录状态（含敏感 token/cookie）
 deepseek_storage_state.json
+config.json
 
-# 测试临时文件
-_test_*.png
 
 # 数据压缩包（原始数据较大，不上传）
 *.zip
