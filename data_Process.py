@@ -3,6 +3,7 @@ import os
 import re
 from unittest import result
 import zipfile
+from datetime import datetime
 import pandas as pd
 import glob
 from tabulate import tabulate
@@ -39,7 +40,13 @@ def read_csv_from_zip(zip_path):
 
 #返回文件的地址
 def read_zip_name():
-    zips = glob.glob("*.zip")
+    # 优先匹配当前月份的 zip 文件
+    now = datetime.now()
+    pattern = f"usage_data_{now.year}_{now.month}*.zip"
+    zips = glob.glob(pattern)
+    if not zips:
+        # fallback: 取所有 zip 中最后一个
+        zips = glob.glob("*.zip")
     if not zips:
         raise FileNotFoundError("当前文件夹没有找到 .zip 文件")
     return os.path.abspath(zips[-1])
@@ -108,7 +115,7 @@ def model_avgcachehit(amount):
         lambda row: 100.0 if row["total"] == 0 else round(row["hit"] / row["total"] * 100, 2),
         axis=1
     )
-
+    # print_centered(merged)
     return merged[["model", "hit_rate"]]
 
 def  draw_datemodelcost():
