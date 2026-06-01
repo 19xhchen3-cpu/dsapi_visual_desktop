@@ -6,6 +6,7 @@ DeepSeek API 使用数据 — 桌面磁贴看板
 """
 
 # ── 标准库 ──────────────────────────────────────────────
+import calendar    # 获取每月天数，用于日期补全
 import json        # 读取 config.json 中的 API Key
 import re          # 正则表达式，用于解析窗口 geometry 字符串
 import threading   # 后台线程执行网络下载，不阻塞 UI
@@ -14,6 +15,7 @@ import tkinter as tk
 from tkinter import Menu
 
 # ── 第三方库 ────────────────────────────────────────────
+import pandas as pd  # DataFrame 操作，用于日期补全
 import matplotlib
 matplotlib.use('TkAgg')  # 指定 matplotlib 后端为 tkinter
 import matplotlib.pyplot as plt
@@ -34,7 +36,7 @@ from data_Process import (
     read_csv_from_zip, read_zip_name,
     data_samedate_cost, data_samemodel_cost,
     data_samedatemodel_tokeninfo, data_samedatemodel_requestinfo, 
-    date_samemodelname_tokeninfo,
+    date_samemodelname_tokeninfo, model_avgcachehit
 )
 
 # ── 全局配置 ────────────────────────────────────────────
@@ -161,10 +163,10 @@ class UsageWidget:
         self.main = tk.Frame(self.root, bg=self._C['bg'])
         self.main.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 2))
 
-        # 四个子帧分别存放折线图、柱状图、饼图、Token 柱状图
-        names = ['line', 'bar', 'pie', 'token']
+        # 五个子帧：前4个在2×2网格，第5个（缓存命中率）跨列在底部
+        names = ['line', 'bar', 'pie', 'token', 'cache_hit']
         self.frames = {}
-        for i, name in enumerate(names):
+        for i, name in enumerate(names[:4]):
             r, c = divmod(i, 2)
             f = tk.Frame(self.main, bg=self._C['bg'],
                          highlightbackground=self._C['border'],
@@ -172,9 +174,17 @@ class UsageWidget:
             f.grid(row=r, column=c, padx=3, pady=3, sticky='nsew')
             self.frames[name] = f
 
-        # 网格权重：四个区域等比例扩展
+        # 第5个帧跨两列放在 row 2
+        f = tk.Frame(self.main, bg=self._C['bg'],
+                     highlightbackground=self._C['border'],
+                     highlightthickness=1)
+        f.grid(row=2, column=0, columnspan=2, padx=3, pady=3, sticky='nsew')
+        self.frames['cache_hit'] = f
+
+        # 网格权重：三行两列等比例扩展
         self.main.grid_rowconfigure(0, weight=1)
         self.main.grid_rowconfigure(1, weight=1)
+        self.main.grid_rowconfigure(2, weight=1)
         self.main.grid_columnconfigure(0, weight=1)
         self.main.grid_columnconfigure(1, weight=1)
 
@@ -571,17 +581,57 @@ class UsageWidget:
     #  图表渲染
     # ══════════════════════════════════════════════════════
 
+    def _fill_monthly_dates(self, df, group_cols, value_col='amount', date_col='utc_date'):
+        """补全当月所有缺失日期，缺失值填 0；df 为空时直接返回"""
+        if df.empty:
+            return df
+
+        # 从数据本身提取年份和月份（不修改原始 df）
+        dates = pd.to_datetime(df[date_col])
+        year = dates.dt.year.iloc[0]
+        month = dates.dt.month.iloc[0]
+        month_days = calendar.monthrange(year, month)[1]
+        all_dates = [f'{year}-{month:02d}-{day:02d}' for day in range(1, month_days + 1)]
+
+        # 获取唯一分组组合，同时携带非分组、非日期、非数值的列（如 type）
+        extra_cols = [c for c in df.columns
+                      if c not in [date_col] + group_cols + [value_col]]
+        groups = df[group_cols + extra_cols].drop_duplicates()
+
+        # 笛卡尔积：所有日期 × 所有分组
+        full_rows = []
+        for _, g in groups.iterrows():
+            for d in all_dates:
+                row = {date_col: d}
+                for col in group_cols:
+                    row[col] = g[col]
+                for col in extra_cols:
+                    row[col] = g[col]
+                full_rows.append(row)
+
+        full = pd.DataFrame(full_rows)
+
+        # 合并原始数据，缺失 amount 填 0
+        merged = full.merge(df, on=list(full.columns), how='left', suffixes=('', '_y'))
+        val_src = f'{value_col}_y' if f'{value_col}_y' in merged.columns else value_col
+        merged[value_col] = merged[val_src].fillna(0).astype(int)
+        merged = merged.drop(columns=[c for c in merged.columns if c.endswith('_y')])
+
+        return merged.sort_values([date_col] + group_cols).reset_index(drop=True)
+
     def _render(self):
         """统一渲染入口：按顺序渲染 4 个图表"""
         cost, amount = self.cost_df, self.amount_df
 
-        # 1 折线图 —— 每日费用趋势
+        # 1 折线图 —— 每日请求量趋势（按 model 分组，补全缺失日期）
         df_line = data_samedatemodel_requestinfo(amount)
+        df_line = self._fill_monthly_dates(df_line, group_cols=['model'])
         self._clear_frame(self.frames['line'])
         self._embed_line(self.frames['line'], df_line)
 
-        # 2 分组堆叠柱状图 —— 每日 Token 消耗（按模型分组，按类型堆叠）
+        # 2 分组堆叠柱状图 —— 每日 Token 消耗（按 model+type 分组，补全缺失日期）
         df_bar = data_samedatemodel_tokeninfo(amount)
+        df_bar = self._fill_monthly_dates(df_bar, group_cols=['model', 'type'])
         self._clear_frame(self.frames['bar'])
         self._embed_grouped_bar(self.frames['bar'], df_bar)
 
@@ -596,6 +646,11 @@ class UsageWidget:
         self._clear_frame(self.frames['token'])
         self._embed_token_bar(self.frames['token'], token_only)
 
+        # 5 模型缓存平均命中率
+        df_cache = model_avgcachehit(amount)
+        self._clear_frame(self.frames['cache_hit'])
+        self._embed_cache_hit(self.frames['cache_hit'], df_cache)
+
     # ── 各图表绘制方法 ──
     # 每个方法创建一个 matplotlib Figure，用 FigureCanvasTkAgg 嵌入 tkinter 帧
 
@@ -604,6 +659,12 @@ class UsageWidget:
         C = self._C
         fig = Figure(figsize=(3.6, 2.4), dpi=100, facecolor=C['fig_face'])
         ax = fig.add_subplot(111, facecolor=C['ax_face'])
+        if df.empty:
+            ax.text(0.5, 0.5, '暂无数据', ha='center', va='center', fontsize=14, color=C['tick_color'])
+            ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+            canvas = FigureCanvasTkAgg(fig, parent); canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            return
         models = sorted(df['model'].unique())
         for i, model in enumerate(models):
             sub = df[df['model'] == model]
@@ -630,6 +691,12 @@ class UsageWidget:
         C = self._C
         fig = Figure(figsize=(3.6, 2.4), dpi=100, facecolor=C['fig_face'])
         ax = fig.add_subplot(111, facecolor=C['ax_face'])
+        if df.empty:
+            ax.text(0.5, 0.5, '暂无数据', ha='center', va='center', fontsize=14, color=C['tick_color'])
+            ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+            canvas = FigureCanvasTkAgg(fig, parent); canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            return
 
         # 只取三种 Token 类型（排除 request_count / total_token）
         type_order = ['input_cache_hit_tokens', 'input_cache_miss_tokens', 'output_tokens']
@@ -690,6 +757,12 @@ class UsageWidget:
         C = self._C
         fig = Figure(figsize=(3.6, 2.4), dpi=100, facecolor=C['fig_face'])
         ax = fig.add_subplot(111, facecolor=C['fig_face'])
+        if df.empty:
+            ax.text(0.5, 0.5, '暂无数据', ha='center', va='center', fontsize=14, color=C['tick_color'])
+            ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+            canvas = FigureCanvasTkAgg(fig, parent); canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            return
         wedges, texts, autotexts = ax.pie(
             df['cost'], labels=df['model'],
             autopct='%1.1f%%',
@@ -711,13 +784,57 @@ class UsageWidget:
         C = self._C
         fig = Figure(figsize=(3.6, 2.4), dpi=100, facecolor=C['fig_face'])
         ax = fig.add_subplot(111, facecolor=C['ax_face'])
+        if df.empty:
+            ax.text(0.5, 0.5, '暂无数据', ha='center', va='center', fontsize=14, color=C['tick_color'])
+            ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+            canvas = FigureCanvasTkAgg(fig, parent); canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            return
         top = df.nlargest(8, 'amount')   # 取前 8 名
         labels = [f"{r['model']}\n({r['api_key_name']})" for _, r in top.iterrows()]
         ax.barh(range(len(top)), top['amount'].values, color='#95E1D3', height=0.55)
+        max_w = top['amount'].max()
+        for i, v in enumerate(top['amount'].values):
+            ax.text(v + max_w * 0.01, i, f'{v:,}', va='center', fontsize=6, color=C['title_fg'])
         ax.set_yticks(range(len(top)))
         ax.set_yticklabels(labels, color=C['title_fg'], fontsize=5.5)
         ax.set_title('角色/模型-总token消耗情况', color=C['title_fg'], fontsize=9, pad=6)
         ax.tick_params(colors=C['tick_color'], labelsize=6)
+        fig.tight_layout(pad=1.5)
+        canvas = FigureCanvasTkAgg(fig, parent)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _embed_cache_hit(self, parent, df):
+        """水平柱状图：展示各模型的缓存命中率"""
+        C = self._C
+        fig = Figure(figsize=(7.2, 1.8), dpi=100, facecolor=C['fig_face'])
+        ax = fig.add_subplot(111, facecolor=C['ax_face'])
+        if df.empty:
+            ax.text(0.5, 0.5, '暂无数据', ha='center', va='center', fontsize=14, color=C['tick_color'])
+            ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+            canvas = FigureCanvasTkAgg(fig, parent); canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            return
+
+        models = df['model'].tolist()
+        rates = df['hit_rate'].tolist()
+        short_names = [m.replace('deepseek-v4-', '') for m in models]
+
+        bars = ax.barh(short_names, rates, color=[COLORS[0], COLORS[1]], height=0.5)
+
+        for bar, rate in zip(bars, rates):
+            ax.text(rate + 1, bar.get_y() + bar.get_height() / 2, f'{rate:.1f}%',
+                    va='center', fontsize=11, color=C['title_fg'])
+
+        ax.set_xlim(0, 110)
+        ax.set_title('模型缓存平均命中率', color=C['title_fg'], fontsize=9, pad=6)
+        ax.tick_params(colors=C['tick_color'], labelsize=8)
+        ax.set_xlabel('命中率 (%)', color=C['label_color'], fontsize=7)
+        ax.set_yticks(range(len(short_names)))
+        ax.set_yticklabels(short_names, color=C['title_fg'], fontsize=8)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
         fig.tight_layout(pad=1.5)
         canvas = FigureCanvasTkAgg(fig, parent)
         canvas.draw()

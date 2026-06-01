@@ -42,7 +42,7 @@ def read_zip_name():
     zips = glob.glob("*.zip")
     if not zips:
         raise FileNotFoundError("当前文件夹没有找到 .zip 文件")
-    return os.path.abspath(zips[0])
+    return os.path.abspath(zips[-1])
 
 #读取对应的文件，将里面的内容进行处理
 def data_samedate_cost(cost):
@@ -87,6 +87,29 @@ def date_samemodelname_tokeninfo(amount):
 
     # print_centered(result)
     return result
+def model_avgcachehit(amount):
+    # 过滤掉 request_count，按 model+type 分组求和
+    by_model = amount[amount["type"] != "request_count"].groupby(["model", "type"])["amount"].sum().reset_index()
+
+    # 计算每个 model 的 total_tokens（所有 type 之和）
+    total = by_model.groupby("model")["amount"].sum().reset_index()
+    total.rename(columns={"amount": "total"}, inplace=True)
+
+    # 提取每个 model 的 input_cache_hit_tokens
+    hit = by_model[by_model["type"] == "input_cache_hit_tokens"][["model", "amount"]].reset_index(drop=True)
+    hit.rename(columns={"amount": "hit"}, inplace=True)
+
+    # 合并
+    merged = total.merge(hit, on="model", how="left")
+    merged["hit"] = merged["hit"].fillna(0)
+
+    # 计算命中率（无数据 → 100%）
+    merged["hit_rate"] = merged.apply(
+        lambda row: 100.0 if row["total"] == 0 else round(row["hit"] / row["total"] * 100, 2),
+        axis=1
+    )
+
+    return merged[["model", "hit_rate"]]
 
 def  draw_datemodelcost():
 
@@ -107,6 +130,7 @@ def main():
     data_samedatemodel_tokeninfo(amount)
     data_samedatemodel_requestinfo(amount)
     date_samemodelname_tokeninfo(amount)
+    model_avgcachehit(amount)
 
 if __name__ == "__main__":
     main()
