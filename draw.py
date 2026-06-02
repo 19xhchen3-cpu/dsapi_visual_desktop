@@ -791,14 +791,20 @@ class UsageWidget:
             canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
             return
         top = df.nlargest(8, 'amount')   # 取前 8 名
-        labels = [f"{r['model']}\n({r['api_key_name']})" for _, r in top.iterrows()]
+        labels = []
+        for _, r in top.iterrows():
+            key_name = r.get('api_key_name', '')
+            if pd.notna(key_name) and key_name not in ('', 'default'):
+                labels.append(f"{r['model']}\n({key_name})")
+            else:
+                labels.append(r['model'].replace('deepseek-v4-', ''))
         ax.barh(range(len(top)), top['amount'].values, color='#95E1D3', height=0.55)
         max_w = top['amount'].max()
         for i, v in enumerate(top['amount'].values):
             ax.text(v + max_w * 0.01, i, f'{v:,}', va='center', fontsize=6, color=C['title_fg'])
         ax.set_yticks(range(len(top)))
         ax.set_yticklabels(labels, color=C['title_fg'], fontsize=5.5)
-        ax.set_title('角色/模型-总token消耗情况', color=C['title_fg'], fontsize=9, pad=6)
+        ax.set_title('模型-Token消耗排名', color=C['title_fg'], fontsize=9, pad=6)
         ax.tick_params(colors=C['tick_color'], labelsize=6)
         fig.tight_layout(pad=1.5)
         canvas = FigureCanvasTkAgg(fig, parent)

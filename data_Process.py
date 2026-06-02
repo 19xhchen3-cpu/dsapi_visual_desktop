@@ -118,7 +118,7 @@ def model_avgcachehit(amount):
     # print_centered(merged)
     return merged[["model", "hit_rate"]]
 
-def  draw_datemodelcost():
+def  draw_datemodelcost(): 
 
     return 0
 

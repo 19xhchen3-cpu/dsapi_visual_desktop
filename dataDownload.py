@@ -1,37 +1,41 @@
 #!/usr/bin/env python3
 """
-DeepSeek API Usage Data Downloader
+DeepSeek API Usage Data Downloader (Optimized)
 
-自动化下载 DeepSeek 用量数据。
+直接调用 platform 内部 API，无需 Playwright 浏览器。
 
 一次性设置（需浏览器界面）：
-    python dataDownload.py --save-state-only     # 登录并保存 cookies
+    python dataDownload.py --save-state-only     # 登录并保存 cookies+token
 
-日常导出（无浏览器窗口，Playwright 无头模式）：
-    python dataDownload.py                       # 读取配置，直接下载
-    python dataDownload.py --output-dir ./数据   # 指定输出目录
+日常导出（瞬间完成）：
+    python dataDownload.py                       # 读取 token，直接下载
+    python dataDownload.py -m 5 -y 2026          # 下载指定月份
+    python dataDownload.py -m 5 -y 2026 --api    # 也下载当月 API 模式用量
 
-发现 API 地址（调试用）：
-    python dataDownload.py --discover-endpoint   # 捕获导出按钮的网络请求
+发现 API 地址（已内置，无需调试）：
+    无头模式下自动拦截 token，无需 --discover-endpoint
 """
 
 import argparse
-import asyncio
+import csv
+import io
 import json
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+import requests
 
 # --- 耗时统计 ---
 _timings = []
+
 
 def _log_step(name):
     now = time.perf_counter()
     if _timings:
         elapsed = now - _timings[-1][1]
-        print(f"  [{name}] 耗时 {elapsed:.1f}s")
+        print(f"  [{name}] {elapsed:.1f}s")
     else:
         print(f"  [{name}]")
     _timings.append((name, now))
@@ -46,16 +50,11 @@ def _print_total_time():
 
 
 # --- 常量 ---
-CONFIG_FILE = "config.json"
-STORAGE_STATE_FILE = "deepseek_storage_state.json"
-USAGE_URL = "https://platform.deepseek.com/usage"
-EXPORT_BUTTON_TEXT = "导出"
-
-# 超时设置
-NAV_LOAD_TIMEOUT = 30_000       # 页面加载
-ELEMENT_TIMEOUT = 20_000        # 元素等待
-DOWNLOAD_TIMEOUT = 60_000       # 下载等待
-LOGIN_WAIT_TIMEOUT = 180_000    # 手动登录等待
+SCRIPT_DIR = Path(__file__).parent.resolve()
+CONFIG_FILE = str(SCRIPT_DIR / "config.json")
+STORAGE_STATE_FILE = str(SCRIPT_DIR / "deepseek_storage_state.json")
+PLATFORM_BASE = "https://platform.deepseek.com"
+TIMEOUT = 15
 
 
 # ============================================================
@@ -64,19 +63,15 @@ LOGIN_WAIT_TIMEOUT = 180_000    # 手动登录等待
 
 def _load_config(config_path: Path) -> dict:
     if not config_path.exists():
-        return _default_config()
+        return {}
     with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _default_config() -> dict:
-    return {
-        "_version": 1,
-        "output_dir": ".",
-        "storage_state": STORAGE_STATE_FILE,
-        "element_timeout": ELEMENT_TIMEOUT,
-        "download_timeout": DOWNLOAD_TIMEOUT,
-    }
+        cfg = json.load(f)
+    # 相对路径 → 基于脚本目录
+    for key in ("storage_state", "output_dir"):
+        val = cfg.get(key)
+        if val and not Path(val).is_absolute():
+            cfg[key] = str(SCRIPT_DIR / val)
+    return cfg
 
 
 def _save_config(config: dict, config_path: Path):
@@ -87,38 +82,125 @@ def _save_config(config: dict, config_path: Path):
 
 
 # ============================================================
-# 查找导出按钮（多策略）
+# Token 提取
 # ============================================================
 
-async def _find_export_button(page):
-    """多策略查找导出按钮"""
-    # 策略1: ds-button 类 + 文本
-    btn = page.locator("button.ds-button").filter(has_text=EXPORT_BUTTON_TEXT)
-    if await btn.count() > 0:
-        return btn.first
-
-    # 策略2: 按文本查找按钮
-    btn = page.get_by_role("button", name=EXPORT_BUTTON_TEXT)
-    if await btn.count() > 0:
-        return btn.first
-
-    # 策略3: 包含文本的任何可点击元素
-    btn = page.get_by_text(EXPORT_BUTTON_TEXT, exact=False).first
-    if await btn.count() > 0:
-        return btn
-
+def _get_bearer_token(storage_state_path: Path) -> str | None:
+    """从 Playwright storage state 的 localStorage 提取 userToken"""
+    if not storage_state_path.exists():
+        return None
+    state = json.loads(storage_state_path.read_text("utf-8"))
+    for o in state.get("origins", []):
+        if "platform.deepseek.com" in o.get("origin", ""):
+            for ls in o.get("localStorage", []):
+                if ls["name"] == "userToken":
+                    val = json.loads(ls["value"])
+                    return val["value"]
     return None
 
 
-async def _wait_for_export_button(page, timeout=10000):
-    """轮询等待导出按钮出现（替代固定 timeout）"""
-    deadline = time.perf_counter() + timeout / 1000
-    while time.perf_counter() < deadline:
-        btn = await _find_export_button(page)
-        if btn:
-            return btn
-        await page.wait_for_timeout(500)
-    return None
+def _extract_cookies(storage_state_path: Path) -> dict:
+    """从 Playwright storage state 提取 cookies"""
+    if not storage_state_path.exists():
+        return {}
+    state = json.loads(storage_state_path.read_text("utf-8"))
+    cookies = {}
+    for c in state.get("cookies", []):
+        if "deepseek.com" in c.get("domain", ""):
+            cookies[c["name"]] = c["value"]
+    return cookies
+
+
+# ============================================================
+# API 调用
+# ============================================================
+
+def _api_get(path: str, token: str) -> dict:
+    """调用 platform.deepseek.com 内部 API"""
+    url = PLATFORM_BASE + path
+    resp = requests.get(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Mozilla/5.0",
+            "X-App-Version": "1.0.0",
+            "Accept": "*/*",
+        },
+        timeout=TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"API error: {data.get('msg', 'unknown')} (code={data.get('code')})")
+    return data["data"]["biz_data"]
+
+
+# ============================================================
+# 数据转换：JSON → CSV
+# ============================================================
+
+FLAT_TYPE_MAP = {
+    "REQUEST": "request_count",
+    "PROMPT_TOKEN": "input_cache_miss_tokens",     # prompt 无缓存时也算 miss
+    "PROMPT_CACHE_HIT_TOKEN": "input_cache_hit_tokens",
+    "PROMPT_CACHE_MISS_TOKEN": "input_cache_miss_tokens",
+    "RESPONSE_TOKEN": "output_tokens",
+}
+
+
+
+def _amount_json_to_csv_rows(biz_data: dict) -> list[tuple]:
+    """amount API 的 JSON → CSV rows for data_Process.py"""
+    SKIP_TYPES = {"PROMPT_TOKEN"}  # 总为 0（已被 hit/miss 拆分替代）
+    SKIP_MODELS = {"deepseek-chat & deepseek-reasoner"}  # 已下架模型
+    rows = []
+    for day in biz_data.get("days", []):
+        date = day["date"]
+        for entry in day["data"]:
+            model = entry["model"]
+            if model in SKIP_MODELS:
+                continue
+            for usage in entry.get("usage", []):
+                utype = usage["type"]
+                if utype in SKIP_TYPES:
+                    continue
+                amount = usage["amount"]
+                flat_type = FLAT_TYPE_MAP.get(utype, utype)
+                rows.append((model, date, flat_type, amount, "default"))
+    return rows
+
+
+def _cost_json_to_csv_rows(biz_data: list | dict) -> list[tuple]:
+    """cost API 的 JSON → CSV rows"""
+    # cost 接口的 biz_data 是列表（包含一个元素），amount 是直接 dict
+    if isinstance(biz_data, list):
+        biz_data = biz_data[0] if biz_data else {}
+    SKIP_TYPES = {"PROMPT_TOKEN"}
+    SKIP_MODELS = {"deepseek-chat & deepseek-reasoner"}
+    rows = []
+    for day in biz_data.get("days", []):
+        date = day["date"]
+        for entry in day["data"]:
+            model = entry["model"]
+            if model in SKIP_MODELS:
+                continue
+            for usage in entry.get("usage", []):
+                utype = usage["type"]
+                if utype in SKIP_TYPES:
+                    continue
+                cost = usage["amount"]
+                flat_type = FLAT_TYPE_MAP.get(utype, utype)
+                rows.append((model, date, flat_type, cost))
+    return rows
+
+
+def _write_csv_to_zip(zf: zipfile.ZipFile, filename: str, rows: list[tuple], headers: list[str]):
+    """将行数据写入 ZIP 内的 CSV 文件"""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    zf.writestr(filename, buf.getvalue().encode("utf-8"))
 
 
 # ============================================================
@@ -126,7 +208,14 @@ async def _wait_for_export_button(page, timeout=10000):
 # ============================================================
 
 async def _do_save_state(storage_state_path: Path):
-    """启动浏览器 → 登录 → 保存 cookies（有界面，仅一次）"""
+    """启动浏览器 → 登录 → 保存 cookies+localStorage（有界面，仅一次）"""
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+    USAGE_URL = "https://platform.deepseek.com/usage"
+    NAV_LOAD_TIMEOUT = 30_000
+    ELEMENT_TIMEOUT = 20_000
+    LOGIN_WAIT_TIMEOUT = 180_000
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(channel="msedge", headless=False)
         context = await browser.new_context()
@@ -146,9 +235,8 @@ async def _do_save_state(storage_state_path: Path):
             print("登录超时，请重新运行。")
             return
 
-        # 等待页面完全渲染
         await page.wait_for_load_state("networkidle", timeout=ELEMENT_TIMEOUT)
-        await page.wait_for_timeout(2000)  # 额外等待前端渲染
+        await page.wait_for_timeout(2000)
 
         await context.storage_state(path=str(storage_state_path))
         print(f"登录状态已保存: {storage_state_path}")
@@ -158,77 +246,38 @@ async def _do_save_state(storage_state_path: Path):
 
 
 # ============================================================
-# 设置模式：发现导出 API（有界面调试）
+# 默认模式：直接 HTTP 下载（无浏览器）
 # ============================================================
 
-async def _do_discover_endpoint(config: dict, config_path: Path):
-    """有界面 → 打开页面 → 点击导出 → 拦截请求 → 保存 API 地址"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(channel="msedge", headless=False)
-        context = await browser.new_context()
-        page = await context.new_page()
+def _download_month(
+    token: str,
+    year: int,
+    month: int,
+    output_dir: Path,
+) -> tuple[list[tuple], list[tuple]]:
+    """下载指定月份的数据，返回 (amount_rows, cost_rows)"""
+    path_amount = f"/api/v0/usage/amount?month={month}&year={year}"
+    path_cost = f"/api/v0/usage/cost?month={month}&year={year}"
 
-        # 拦截网络请求
-        export_urls = set()
+    print(f"正在获取 {year}年{month}月 用量数据...")
+    amount_data = _api_get(path_amount, token)
+    print(f"  用量数据: {len(amount_data.get('days', []))} 天")
+    _log_step("用量数据")
 
-        def on_request(request):
-            url = request.url
-            if any(kw in url.lower() for kw in ["export", "download", "usage/csv", "usage/file"]):
-                if ".deepseek.com" in url:
-                    export_urls.add(url)
+    print(f"正在获取 {year}年{month}月 费用数据...")
+    cost_data = _api_get(path_cost, token)
+    cost_days = cost_data[0].get('days', []) if isinstance(cost_data, list) else cost_data.get('days', [])
+    print(f"  费用数据: {len(cost_days)} 天")
+    _log_step("费用数据")
 
-        page.on("request", on_request)
-
-        print(f"正在打开页面: {USAGE_URL}")
-        await page.goto(USAGE_URL, wait_until="networkidle", timeout=NAV_LOAD_TIMEOUT)
-
-        if "/login" in page.url.lower():
-            print("请先在浏览器中登录...")
-            try:
-                await page.wait_for_url("**/usage", timeout=LOGIN_WAIT_TIMEOUT)
-            except PlaywrightTimeout:
-                print("登录超时")
-                return
-
-        print("正在查找导出按钮...")
-        btn = await _find_export_button(page)
-        if btn is None:
-            await page.screenshot(path="debug_discover.png")
-            print("未找到导出按钮，已保存截图 debug_discover.png")
-            await context.close()
-            await browser.close()
-            return
-
-        print("正在点击导出，捕获 API 地址...")
-        async with page.expect_download(timeout=DOWNLOAD_TIMEOUT) as dl_info:
-            await btn.click()
-        await dl_info.value
-
-        if export_urls:
-            discovered = list(export_urls)
-            print(f"\n发现 {len(discovered)} 个请求:")
-            for i, url in enumerate(discovered, 1):
-                print(f"  {i}. {url}")
-            chosen = discovered[-1]
-            config["export_api_url"] = chosen
-            _save_config(config, config_path)
-            print(f"\n已写入 config.json: export_api_url = {chosen}")
-        else:
-            print("未捕获到导出请求，请检查浏览器 DevTools 的 Network 面板。")
-
-        await context.close()
-        await browser.close()
+    # 转 CSV
+    amount_rows = _amount_json_to_csv_rows(amount_data)
+    cost_rows = _cost_json_to_csv_rows(cost_data)
+    return amount_rows, cost_rows
 
 
-# ============================================================
-# 默认模式：Playwright 无头导出（无窗口）
-# ============================================================
-
-async def _do_export(config: dict, output_dir: Path, timeout: int):
-    """
-    Playwright 无头模式 → 加载登录态 → 打开页面 → 点击导出 → 保存文件
-    全程无可见浏览器窗口。
-    """
+def _do_export(config: dict, output_dir: Path, year: int, month: int):
+    """直接 HTTP 下载并保存为 ZIP"""
     storage_state_path = Path(config.get("storage_state", STORAGE_STATE_FILE))
     if not storage_state_path.exists():
         print(f"错误: 登录状态文件不存在 ({storage_state_path})")
@@ -236,77 +285,48 @@ async def _do_export(config: dict, output_dir: Path, timeout: int):
         return
 
     _timings.clear()
-    async with async_playwright() as p:
-        browser = None
-        context = None
-        try:
-            # 1. 启动无头浏览器
-            print("正在启动浏览器（无头模式）...")
-            browser = await p.chromium.launch(
-                channel="msedge",
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            _log_step("浏览器启动")
+    _log_step("开始")
 
-            # 2. 加载已保存的登录状态
-            with open(storage_state_path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            context = await browser.new_context(storage_state=state)
-            page = await context.new_page()
+    # 1. 提取 Token
+    token = _get_bearer_token(storage_state_path)
+    if not token:
+        print("错误: 未找到 userToken，请重新运行 --save-state-only")
+        return
+    print(f"Token 已加载 ({len(token)} 字符)")
+    _log_step("Token 提取")
 
-            # 3. 打开用量页面（domcontentloaded 比 networkidle 快得多）
-            print(f"正在打开页面: {USAGE_URL}")
-            await page.goto(USAGE_URL, wait_until="domcontentloaded", timeout=NAV_LOAD_TIMEOUT)
-            _log_step("页面加载")
+    # 2. 下载数据
+    try:
+        amount_rows, cost_rows = _download_month(token, year, month, output_dir)
+    except requests.HTTPError as e:
+        resp = e.response
+        if resp.status_code == 401:
+            print("错误: Token 已过期，请重新运行 --save-state-only")
+        else:
+            print(f"错误: HTTP {resp.status_code}")
+        return
 
-            # 4. 检查是否被重定向到登录页
-            if "/login" in page.url.lower():
-                print("登录状态已失效，请重新运行 --save-state-only")
-                return
+    # 3. 写入 ZIP
+    zip_name = f"usage_data_{year}_{month}.zip"
+    save_path = output_dir / zip_name
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-            # 5. 等待渲染完成且导出按钮可点（替代固定 3s 等待）
-            await page.wait_for_load_state("networkidle", timeout=ELEMENT_TIMEOUT)
-            btn = await _wait_for_export_button(page, timeout=10000)
-            if btn is None:
-                await page.screenshot(path="debug_export.png")
-                raise RuntimeError(
-                    f"找不到导出按钮，已保存截图 debug_export.png\n"
-                    f"请尝试运行 --discover-endpoint 排查页面结构"
-                )
-            _log_step("页面渲染")
+    with zipfile.ZipFile(save_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        # 注意写入顺序：data_Process.read_csv_from_zip 按 CSV 在 ZIP 里的顺序读取
+        # 第 1 个 CSV → cost，第 2 个 → amount
+        _write_csv_to_zip(
+            zf, "cost.csv", cost_rows,
+            ["model", "utc_date", "type", "cost"],
+        )
+        _write_csv_to_zip(
+            zf, "amount.csv", amount_rows,
+            ["model", "utc_date", "type", "amount", "api_key_name"],
+        )
 
-            # 6. 点击并下载
-            print(f"正在点击「{EXPORT_BUTTON_TEXT}」按钮...")
-            async with page.expect_download(timeout=timeout) as dl_info:
-                await btn.click()
-
-            download = await dl_info.value
-            _log_step("下载完成")
-
-            # 7. 保存文件
-            suggested = download.suggested_filename
-            if not suggested:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                suggested = f"deepseek_usage_{timestamp}.csv"
-
-            save_path = output_dir / suggested
-
-            output_dir.mkdir(parents=True, exist_ok=True)
-            await download.save_as(str(save_path))
-            print(f"下载成功: {save_path}")
-            _log_step("文件保存")
-
-        except PlaywrightTimeout as e:
-            print(f"错误: 操作超时 - {e}")
-        except Exception as e:
-            print(f"错误: {e}")
-            raise
-        finally:
-            if context:
-                await context.close()
-            if browser:
-                await browser.close()
+    print(f"下载成功: {save_path}")
+    print(f"  amount.csv: {len(amount_rows)} 行")
+    print(f"  cost.csv:   {len(cost_rows)} 行")
+    _log_step("文件保存")
 
 
 # ============================================================
@@ -319,21 +339,23 @@ def create_parser() -> argparse.ArgumentParser:
     # 操作模式
     parser.add_argument(
         "--save-state-only", action="store_true",
-        help="启动浏览器登录并保存 cookies（一次性设置）",
-    )
-    parser.add_argument(
-        "--discover-endpoint", action="store_true",
-        help="有界面模式下发现导出 API 地址（调试用）",
+        help="启动浏览器登录并保存 cookies/token（一次性设置）",
     )
 
-    # 导出参数
+    # 月份参数
+    parser.add_argument(
+        "-m", "--month", type=int, default=None,
+        help="月份 (1-12，默认当前月份)",
+    )
+    parser.add_argument(
+        "-y", "--year", type=int, default=None,
+        help="年份 (默认当前年份)",
+    )
+
+    # 输出
     parser.add_argument(
         "--output-dir", "-o", default=None,
         help="文件保存目录（覆盖 config.json）",
-    )
-    parser.add_argument(
-        "--timeout", type=int, default=None,
-        help="下载等待超时秒数（默认 60）",
     )
 
     return parser
@@ -348,18 +370,17 @@ def main():
     # --- 保存登录状态 ---
     if args.save_state_only:
         storage = Path(config.get("storage_state", STORAGE_STATE_FILE))
+        import asyncio
         asyncio.run(_do_save_state(storage))
         return
 
-    # --- 发现 API 地址 ---
-    if args.discover_endpoint:
-        asyncio.run(_do_discover_endpoint(config, config_path))
-        return
-
     # --- 默认导出 ---
+    now = datetime.now()
+    year = args.year or now.year
+    month = args.month or now.month
     output_dir = Path(args.output_dir or config.get("output_dir", "."))
-    timeout = (args.timeout or config.get("download_timeout", DOWNLOAD_TIMEOUT))
-    asyncio.run(_do_export(config, output_dir, timeout))
+
+    _do_export(config, output_dir, year, month)
     _print_total_time()
 
 

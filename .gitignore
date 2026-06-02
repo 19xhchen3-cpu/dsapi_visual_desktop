@@ -5,6 +5,7 @@ __pycache__/
 
 # 浏览器登录状态（含敏感 token/cookie）
 deepseek_storage_state.json
+# 含个人api_key信息
 config.json
 
 
