@@ -12,7 +12,7 @@ config.json
 # 数据压缩包（原始数据较大，不上传）
 *.zip
 # 解压后的数据目录
-usage_data_2026_5/
+usage_data_*/
 
 # IDE 设置（个人偏好）
 .vscode/
